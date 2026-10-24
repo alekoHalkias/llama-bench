@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Delete all benchmark results, optionally backing them up first.
+
+Asks whether to back up results/ into a maximum-compression zip in backups/,
+then asks again before deleting. Restore a backup from the project folder with:
+    python3 -m zipfile -e backups/<file>.zip .
+"""
+import os
+import shutil
+import sys
+import time
+import zipfile
+
+root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+results = os.environ.get("RESULTS", os.path.join(root, "results"))
+backups = os.environ.get("BACKUPS", os.path.join(root, "backups"))
+
+
+def ask(question, default):
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"{question} {hint} ").strip().lower()
+    except EOFError:
+        answer = ""
+    return default if not answer else answer in ("y", "yes")
+
+
+entries = sorted(os.listdir(results)) if os.path.isdir(results) else []
+runs = [e for e in entries if os.path.isdir(os.path.join(results, e))]
+if not entries:
+    sys.exit(f"Nothing to purge in {results}")
+print(f"{results}: {len(runs)} run(s), {len(entries) - len(runs)} other file(s) (stats.csv, failures.md)")
+
+if ask("Back up the results to a zip file first?", True):
+    os.makedirs(backups, exist_ok=True)
+    zip_path = os.path.join(backups, f"results-{time.strftime('%Y%m%d-%H%M%S')}.zip")
+    parent = os.path.dirname(results)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for dirpath, _, files in os.walk(results):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                z.write(path, os.path.relpath(path, parent))  # stored as results/..., so it restores in place
+    with zipfile.ZipFile(zip_path) as z:
+        bad = z.testzip()
+        count = len(z.namelist())
+    if bad:
+        sys.exit(f"Backup is corrupt ({bad}); nothing deleted. Zip: {zip_path}")
+    print(f"Backed up {count} files to {zip_path} ({os.path.getsize(zip_path) / 1e6:.1f} MB)")
+    print(f"Restore with: cd {parent} && python3 -m zipfile -e {zip_path} .")
+else:
+    print("No backup made.")
+
+if not ask(f"Delete everything in {results}?", False):
+    sys.exit("Nothing deleted.")
+for e in entries:
+    path = os.path.join(results, e)
+    shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+print(f"Deleted {len(entries)} item(s).")

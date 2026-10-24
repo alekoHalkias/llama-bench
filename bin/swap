@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Start llama-swap with this project's config.
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+exec llama-swap --config "$ROOT/llama-swap/config.yaml" --listen "${LISTEN:-localhost:8001}" "$@"

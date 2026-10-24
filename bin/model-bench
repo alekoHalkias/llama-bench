@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# model-bench: run the same Claude Code task against several local models
+# (served by llama-swap) and record time, turns and a pass/fail check.
+#
+# Each model starts in an empty folder with a read-only snapshot of the linked
+# project (without its agent instructions, so the project's own workflow doesn't
+# apply), and writes the task's output files into that folder.
+#
+# The linked project is the path given as the first argument, else PROJECT,
+# else the "project" symlink next to bin/. It can be a git repo (REF is
+# exported with git archive) or any folder (copied, minus .git and node_modules).
+# With none of these, tasks run standalone: no project, just the prompt.
+#
+# Usage:
+#   model-bench ~/code/myproject              # pick models from a checklist (in a terminal)
+#   MODELS=all model-bench ~/code/myproject   # every model llama-swap lists, no checklist
+#   MODELS="qwen3.6-mtp gemma4-26b" model-bench ~/code/myproject
+#   TASKS_DIR=~/code/other-tasks model-bench ~/code/other
+#   TASKS_DIR=standalone model-bench          # self-contained tasks, no project
+#   model-bench -l 3 ~/code/myproject         # every task 3 times per model (one load), into $OUT-p1..p3
+#
+# Task files: one .md file per task in TASKS_DIR. The file is the prompt.
+# Optional first line "# check: <command>" is run in the output folder
+# afterwards; exit code 0 = pass. $TASKS_DIR and $MODEL are set for the check, so it can
+# run a validator kept next to the task, e.g. python3 "$TASKS_DIR/calc_test.py".
+# "[llm model name]" in a task file is replaced with the model id, and "[results folder]"
+# with $OUT/<model>--<task>/, which is made before the model starts.
+#
+# Saved results: $OUT/<model>--<task>/ (the model's files), .jsonl log, .check.log,
+# and $OUT/<model>.load.log (llama-server output) when a model fails to load
+
+set -uo pipefail
+
+# keep the machine awake for the whole run (idle sleep or lid close would kill it)
+if [ -z "${BENCH_INHIBITED:-}" ] && command -v systemd-inhibit >/dev/null; then
+  BENCH_INHIBITED=1 exec systemd-inhibit --what=sleep:idle:handle-lid-switch \
+    --who=model-bench --why="benchmark run" "$(readlink -f "$0")" "$@"
+fi
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+LOOPS=1
+while getopts l: opt; do
+  case $opt in
+    l) LOOPS=$OPTARG ;;
+    *) echo "Usage: model-bench [-l passes] [/path/to/project]"; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ "$LOOPS" =~ ^[1-9][0-9]*$ ]] || { echo "-l needs a whole number of passes (1 or more)"; exit 1; }
+PROJECT="${1:-${PROJECT:-}}"
+[ -z "$PROJECT" ] && [ -d "$ROOT/project" ] && PROJECT="$ROOT/project"
+REF="${REF:-HEAD}"
+STRIP="${STRIP:-CLAUDE.md CLAUDE.local.md AGENTS.md .claude}"
+TASKS_DIR="${TASKS_DIR:-$ROOT/standalone}"
+RUN="${RUN:-$(date +%Y%m%d-%H%M)}"
+OUT="${OUT:-$ROOT/results/$RUN}"
+# One run folder per pass, so every other tool still sees one result per model and task.
+OUTS=("$OUT"); [ "$LOOPS" -gt 1 ] && mapfile -t OUTS < <(for i in $(seq "$LOOPS"); do echo "$OUT-p$i"; done)
+BASE_URL="${BASE_URL:-http://localhost:8001}"
+
+command -v claude >/dev/null || { echo "claude not found on PATH"; exit 1; }
+if [ -n "$PROJECT" ]; then
+  [ -d "$PROJECT" ] || { echo "No project folder at $PROJECT. Usage: model-bench [/path/to/project]"; exit 1; }
+  PROJECT=$(cd "$PROJECT" && pwd -P)
+  PROJECT_NAME=$(basename "$PROJECT")
+else
+  PROJECT_NAME="none"
+fi
+compgen -G "$TASKS_DIR/*.md" >/dev/null || { echo "No task files in $TASKS_DIR"; exit 1; }
+TASKS_DIR=$(cd "$TASKS_DIR" && pwd)  # absolute, because checks run from the output folder
+curl -sf "$BASE_URL/health" >/dev/null || { echo "llama-swap not reachable at $BASE_URL"; exit 1; }
+
+# Inline checklist drawn on stderr, all ticked but claude-* (they cost quota); prints the ticked items. Subshell, so the
+# cursor-restoring trap stays local. ponytail: no scrolling, fine for a screenful of models
+pick() (
+  local -a items=("$@") on; local i cur=0 n=$# key
+  for i in "${!items[@]}"; do [[ ${items[i]} == claude-* ]]; on[i]=$?; done
+  trap 'printf "\e[?25h" >&2' EXIT
+  printf '\e[?25lModels to run: up/down moves, space toggles, a ticks all/none, enter starts, q quits\n' >&2
+  while :; do
+    for i in "${!items[@]}"; do
+      printf '\r\e[K%s [%s] %s\n' "$( ((i == cur)) && echo '>' || echo ' ')" \
+        "$( ((on[i])) && echo x || echo ' ')" "${items[i]}" >&2
+    done
+    IFS= read -rsn1 key
+    [ "$key" = $'\e' ] && { read -rsn2 -t 0.1 key; key="esc$key"; }
+    case $key in
+      'esc[A' | k) ((cur = (cur + n - 1) % n)) ;;
+      'esc[B' | j) ((cur = (cur + 1) % n)) ;;
+      ' ') ((on[cur] = !on[cur])) ;;
+      a) all=0; for i in "${!items[@]}"; do ((on[i])) || all=1; done
+         for i in "${!items[@]}"; do on[i]=$all; done ;;
+      '') break ;;
+      q) exit 1 ;;
+    esac
+    printf '\e[%dA' "$n" >&2
+  done
+  for i in "${!items[@]}"; do if ((on[i])); then printf '%s ' "${items[i]}"; fi; done
+)
+
+asked="${MODELS:-}"
+if [ -z "$asked" ] || [ "$asked" = "all" ]; then
+  MODELS=$(curl -s "$BASE_URL/v1/models" | python3 -c '
+import json, sys
+ids = [m["id"] for m in json.load(sys.stdin).get("data", [])]
+# skip profile pins like "local", "local-think", "local-fast" (they point at real models)
+print(" ".join(i for i in ids if not (i == "local" or i.startswith("local-"))))')
+  # No MODELS given and running in a terminal: pick models from a checklist (all ticked but Claude).
+  if [ -z "$asked" ] && [ -t 0 ] && [ -t 2 ]; then
+    read -r -a found <<< "$MODELS claude-haiku-5-5 claude-sonnet-5-5 claude-opus-5-5"
+    MODELS=$(pick "${found[@]}") || { echo "Cancelled."; exit 1; }
+    [ -n "$MODELS" ] || { echo "No models ticked."; exit 1; }
+  fi
+fi
+read -r -a MODEL_LIST <<< "$MODELS"
+[ "${#MODEL_LIST[@]}" -gt 0 ] || { echo "No models found"; exit 1; }
+echo "Models: ${MODEL_LIST[*]}"
+echo "Run:    $RUN$([ "$LOOPS" -gt 1 ] && echo " ($LOOPS passes: -p1..-p$LOOPS)")"
+
+# Outside any repo, so no parent CLAUDE.md or project settings get loaded.
+WORK=$(mktemp -d -t model-bench.XXXXXX)
+trap 'chmod -R u+w "${WORK:?}"; rm -rf "${WORK:?}"' EXIT
+SRC="$WORK/src"
+mkdir -p "$SRC" "${OUTS[@]}"
+if [ -z "$PROJECT" ]; then
+  version="standalone"
+elif [ "$(git -C "$PROJECT" rev-parse --show-toplevel 2>/dev/null)" = "$PROJECT" ]; then
+  git -C "$PROJECT" archive "$REF" | tar -x -C "$SRC" || { echo "git archive of $REF failed"; exit 1; }
+  version="git $REF ($(git -C "$PROJECT" rev-parse --short "$REF"))"
+else
+  # ponytail: plain folders are copied whole except these; add excludes if a project has other big build dirs
+  tar -C "$PROJECT" --exclude=.git --exclude=node_modules -cf - . | tar -x -C "$SRC" || { echo "copy of $PROJECT failed"; exit 1; }
+  version="folder copy"
+fi
+for f in $STRIP; do rm -rf "${SRC:?}/$f"; done
+chmod -R a-w "$SRC"
+echo "Project: ${PROJECT:-none} ($version)"
+STATS="prompt_tokens,cached_tokens,prompt_s,prompt_tps,prompt_ms_tok,gen_tokens,gen_s,gen_tps,gen_ms_tok"
+for out in "${OUTS[@]}"; do
+  printf 'project=%s
+version=%s
+tasks=%s
+' "${PROJECT:-none}" "$version" "$TASKS_DIR" > "$out/run.txt"
+  echo "model,project,task,seconds,turns,check,error,files,$STATS" > "$out/results.csv"
+done
+
+# llama-server's cumulative counters (needs --metrics in the llama-swap config).
+# Strata's /metrics is JSON; it serves the same llamacpp: counters at /metrics/prometheus.
+metrics() {
+  curl -s "$BASE_URL/upstream/$1/metrics" | grep '^llamacpp:' ||
+    curl -s "$BASE_URL/upstream/$1/metrics/prometheus" | grep '^llamacpp:'
+}
+# Difference of two metrics() snapshots, as the $STATS columns ("-" without --metrics).
+# ponytail: counters print as doubles (6 digits), so past ~1M total tokens a delta can be off by a few tokens
+token_stats() {
+  awk 'NR == FNR { a[$1] = $2; next } { d[substr($1, 10)] = $2 - a[$1] }
+    END {
+      if (!("prompt_tokens_total" in d)) { print "-,-,-,-,-,-,-,-,-"; exit }
+      pt = d["prompt_tokens_total"]; ps = d["prompt_seconds_total"]
+      gt = d["tokens_predicted_total"]; gs = d["tokens_predicted_seconds_total"]
+      printf "%d,%d,%.1f,%s,%s,%d,%.1f,%s,%s\n", pt, d["prompt_tokens_cached_total"], ps,
+        ps ? sprintf("%.1f", pt / ps) : "-", pt ? sprintf("%.2f", ps * 1000 / pt) : "-",
+        gt, gs, gs ? sprintf("%.1f", gt / gs) : "-", gt ? sprintf("%.2f", gs * 1000 / gt) : "-"
+    }' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+for model in "${MODEL_LIST[@]}"; do
+  safe=$(printf '%s' "$model" | tr -c 'A-Za-z0-9._-' '-')
+  settings="${OUTS[0]}/settings-$safe.json"
+  # claude-* ids go to Anthropic's API with the user's own login: no llama-swap, no warm-up, no token stats.
+  if [[ $model == claude-* ]]; then
+    endpoint="" key=()
+  else
+    endpoint="\"ANTHROPIC_BASE_URL\": \"$BASE_URL\", \"ANTHROPIC_AUTH_TOKEN\": \"local\", \"ANTHROPIC_API_KEY\": \"local\","
+    key=(ANTHROPIC_API_KEY=local)
+  fi
+  cat > "$settings" <<EOF
+{
+  "env": {
+    $endpoint
+    "ANTHROPIC_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$model",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$model",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "55",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "deny": ["Edit(/$SRC/**)"]
+  }
+}
+EOF
+  for out in "${OUTS[@]:1}"; do cp "$settings" "$out/"; done
+
+  echo "== $model: loading (not timed) =="
+  warm='"content"'
+  [[ $model == claude-* ]] || warm=$(curl -s --max-time 600 "$BASE_URL/v1/messages" -H 'content-type: application/json' \
+    -d "{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+  if ! printf '%s' "$warm" | grep -q '"content"'; then
+    echo "   $model failed to load, skipping. Response: ${warm:0:200}"
+    # The upstream log replays every llama-server start; keep only the last one (this model's).
+    { echo "$warm"; echo; timeout 2 curl -sN "$BASE_URL/logs/stream/upstream" \
+      | awk '/llama_server: initializing/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }'; } > "${OUTS[0]}/$safe.load.log"
+    for out in "${OUTS[@]}"; do
+      [ "$out" = "${OUTS[0]}" ] || cp "${OUTS[0]}/$safe.load.log" "$out/"
+      for task in "$TASKS_DIR"/*.md; do
+        echo "$model,$PROJECT_NAME,$(basename "$task" .md),-,-,-,load-failed,-,-,-,-,-,-,-,-,-,-" >> "$out/results.csv"
+      done
+    done
+    continue
+  fi
+
+  # Every pass of this model runs on the one load. Body left unindented: the PY heredoc can't move.
+  for ((pass = 1; pass <= LOOPS; pass++)); do out=${OUTS[pass - 1]}
+  for task in "$TASKS_DIR"/*.md; do
+    name=$(basename "$task" .md)
+    work="$WORK/$safe--$name"
+    base="$out/$safe--$name"
+    check=$(sed -n '1s/^# *check: *//p' "$task")
+    # Standalone: the prompt is the task file alone. With a project, a preamble names $SRC.
+    prompt=$(sed '1{/^# *check:/d}' "$task")
+    prompt=${prompt//"[llm model name]"/$model}  # the model can't know its own id
+    prompt=${prompt//"[results folder]"/$base}    # this model's results folder, made below
+    add_dir=(--add-dir "$base")
+    if [ -n "$PROJECT" ]; then
+      prompt="The project's source code is in $SRC. It is read-only: read it to understand the project, but do not change it. Write every file you create to the current directory, $work.
+
+$prompt"
+      add_dir+=(--add-dir "$SRC")
+    fi
+
+    rm -rf "$base" "$work"; mkdir -p "$work" "$base"
+    echo "-- $model / $name$([ "$LOOPS" -gt 1 ] && echo " (pass $pass/$LOOPS)")"
+    before=$(metrics "$model")
+    start=$(date +%s)
+    # --setting-sources project,local skips user settings, so no user plugins, hooks or skills
+    # (the --settings file still applies). Full default tool set, no permission prompts.
+    ( cd "$work" && env "${key[@]}" claude -p "$prompt" --setting-sources project,local \
+        --strict-mcp-config \
+        --settings "$settings" \
+        "${add_dir[@]}" \
+        --output-format stream-json --verbose \
+        --permission-mode bypassPermissions ) > "$base.jsonl" 2>&1
+    secs=$(( $(date +%s) - start ))
+    tokens=$(token_stats "$before" "$(metrics "$model")")
+    IFS=, read -r pt _ ps ptps _ gt gs gtps _ <<< "$tokens"
+    echo "   ${secs}s  prompt $pt tok in ${ps}s ($ptps tok/s)  gen $gt tok in ${gs}s ($gtps tok/s)"
+
+    read -r turns err < <(python3 - "$base.jsonl" <<'PY'
+import json, sys
+turns, err = "", "no"
+for line in open(sys.argv[1], errors="ignore"):
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(d, dict) and d.get("type") == "result":
+        turns = str(d.get("num_turns", ""))
+        err = "yes" if d.get("is_error") else "no"
+print(turns or "-", err)
+PY
+)
+
+    cp -r "$work/." "$base/"  # anything written to the cwd instead of the results folder
+    files=$(find "$base" -type f | wc -l)
+
+    result="n/a"
+    if [ -n "$check" ]; then
+      if ( cd "$base" && TASKS_DIR="$TASKS_DIR" MODEL="$model" bash -xc "$check" ) > "$base.check.log" 2>&1; then
+        result="pass"
+      else
+        result="fail"
+      fi
+    fi
+
+    echo "$model,$PROJECT_NAME,$name,$secs,$turns,$result,$err,$files,$tokens" >> "$out/results.csv"
+  done
+  done
+done
+
+for out in "${OUTS[@]}"; do
+  echo
+  column -s, -t "$out/results.csv"
+  echo
+  echo "Results: $out"
+done

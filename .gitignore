@@ -1,0 +1,6 @@
+backups/
+project
+*.bak
+.claude/settings.local.json
+results/*
+!results/.gitkeep

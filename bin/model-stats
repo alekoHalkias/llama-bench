@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Combine every results/<run>/results.csv into per-model/project/task stats.
+
+Prints a table and writes it to results/stats.csv. Only runs from the current
+design (results.csv has a "files" column) are counted; older runs used a
+different setup and check, so they aren't comparable.
+"""
+import csv
+import glob
+import os
+import statistics
+import sys
+from collections import defaultdict
+
+root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+results = os.environ.get("RESULTS", os.path.join(root, "results"))
+groups = defaultdict(list)
+for path in sorted(glob.glob(os.path.join(results, "*", "results.csv"))):
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        if "files" not in (reader.fieldnames or []):
+            continue
+        for row in reader:
+            groups[row["model"], row.get("project", "-"), row["task"]].append(row)
+
+
+def nums(rows, key):
+    return [float(r[key]) for r in rows if r.get(key, "-").replace(".", "", 1).isdigit()]
+
+
+def avg(rows, key):
+    n = nums(rows, key)
+    return f"{sum(n) / len(n):.1f}" if n else "-"
+
+
+def sd(rows, key):
+    n = nums(rows, key)
+    return f"{statistics.stdev(n):.1f}" if len(n) > 1 else "-"
+
+
+def outliers(rows, key):
+    """Runs outside 1.5 x IQR (Tukey's fences); needs 4+ runs to mean anything."""
+    n = nums(rows, key)
+    if len(n) < 4:
+        return "-"
+    q1, _, q3 = statistics.quantiles(n, n=4)
+    lo, hi = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+    return sum(not lo <= v <= hi for v in n)
+
+
+header = ["model", "project", "task", "runs", "passed", "pass_rate", "load_failed", "avg_seconds", "sd_seconds", "outliers", "avg_turns", "avg_files",
+          "avg_prompt_tokens", "avg_prompt_tps", "avg_gen_tokens", "avg_gen_tps"]
+table = []
+for (model, project, task), rows in sorted(groups.items()):
+    done = [r for r in rows if r["error"] != "load-failed"]
+    passed = sum(r["check"] == "pass" for r in done)
+    table.append([model, project, task, len(rows), passed,
+                  f"{100 * passed / len(done):.0f}%" if done else "-",
+                  len(rows) - len(done), avg(done, "seconds"), sd(done, "seconds"), outliers(done, "seconds"), avg(done, "turns"), avg(done, "files"),
+                  *(avg(done, k) for k in ("prompt_tokens", "prompt_tps", "gen_tokens", "gen_tps"))])
+
+out = os.path.join(results, "stats.csv")
+with open(out, "w", newline="") as f:
+    csv.writer(f).writerows([header, *table])
+
+widths = [max(len(str(r[i])) for r in [header, *table]) for i in range(len(header))]
+
+
+def show(rows):
+    for r in [header, *rows]:
+        print("  ".join(str(v).ljust(w) for v, w in zip(r, widths)))
+
+
+def by(col, best_high, rows=table):
+    """Rows sorted on a numeric column, best first, "-" last; ties keep the order of rows."""
+    i = header.index(col)
+    def key(r):
+        try:
+            v = float(str(r[i]).rstrip("%"))
+        except ValueError:
+            return (1, 0)
+        return (0, -v if best_high else v)
+    return sorted(rows, key=key)
+
+
+show(table)
+print(f"\nSaved: {out}")
+
+# In a terminal, re-sort the table on request.
+sorts = {"p": lambda: by("pass_rate", True, by("avg_seconds", False)),  # ties: fastest first
+"s": lambda: by("avg_seconds", False), "m": lambda: table}
+while sys.stdin.isatty():
+    try:
+        choice = input("\nSort by [p]ass rate, [s]econds, [m]odel, or [q]uit: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        break
+    if choice not in sorts:
+        break
+    print()
+    show(sorts[choice]())

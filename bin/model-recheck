@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Re-run each task's current "# check:" line on every saved result.
+
+Use after fixing a check. Updates the check column in results/<run>/results.csv
+and rewrites <model>--<task>.check.log. The task file comes from the tasks
+folder recorded in the run's run.txt (else tasks/ in this folder). Only runs from
+the current design (results.csv has a "files" column) are rechecked.
+"""
+import csv
+import glob
+import os
+import re
+import subprocess
+
+root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+results = os.environ.get("RESULTS", os.path.join(root, "results"))
+
+changed = 0
+for csv_path in sorted(glob.glob(os.path.join(results, "*", "results.csv"))):
+    run_dir = os.path.dirname(csv_path)
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        rows = list(reader)
+    if "files" not in fields:
+        continue
+    tasks_dir = os.path.join(root, "tasks")
+    info = os.path.join(run_dir, "run.txt")
+    if os.path.exists(info):
+        tasks_dir = dict(l.rstrip("\n").split("=", 1) for l in open(info) if "=" in l).get("tasks", tasks_dir)
+    for r in rows:
+        if r["error"] == "load-failed":
+            continue
+        task_file = os.path.join(tasks_dir, r["task"] + ".md")
+        if not os.path.exists(task_file):
+            print(f"skip {os.path.basename(run_dir)} {r['model']} {r['task']}: no task file {task_file}")
+            continue
+        m = re.match(r"# *check: *(.*)", open(task_file).readline())
+        base = os.path.join(run_dir, f"{re.sub(r'[^A-Za-z0-9._-]', '-', r['model'])}--{r['task']}")
+        if not m or not os.path.isdir(base):
+            continue
+        with open(base + ".check.log", "w") as log:
+            env = {**os.environ, "TASKS_DIR": os.path.abspath(tasks_dir), "MODEL": r["model"]}
+            ok = subprocess.run(["bash", "-xc", m.group(1)], cwd=base, env=env, stdout=log, stderr=log).returncode == 0
+        new = "pass" if ok else "fail"
+        if new != r["check"]:
+            print(f"{os.path.basename(run_dir)}  {r['model']:<16} {r['task']:<10} {r['check']} -> {new}")
+            r["check"] = new
+            changed += 1
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+print(f"{changed} result(s) changed.")
